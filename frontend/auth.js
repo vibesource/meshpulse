@@ -89,7 +89,10 @@
             S.raw(JSON.stringify({type: 'auth', password: input.value}));
         });
         dlg.querySelector('.mp-cancel').addEventListener('click', function () {
+            var cancelled = S.queue.map(function (m) { try { return JSON.parse(m).request_id; } catch (e) { return null; } }).filter(Boolean);
             S.queue = [];
+            cancelled.forEach(function (id) { delete S.last['id:' + id]; });
+            if (S.ws && cancelled.length) S.ws.dispatchEvent(new CustomEvent('meshauthcancel', {detail: cancelled}));
             closePrompt();
         });
         setTimeout(function () { input.focus(); }, 0);
@@ -118,6 +121,7 @@
         var d;
         try { d = JSON.parse(ev.data); } catch (e) { return; }
         if (!d || !d.type) return;
+        if (d.type === 'send_result' && d.request_id) delete S.last['id:' + d.request_id];
         if (d.type === 'auth_status') {
             S.known = true;
             S.required = !!d.required;
@@ -151,7 +155,7 @@
             // Sent before we knew a password was set, or a session ended: ask, then resend.
             S.required = true;
             S.authed = false;
-            var m = S.last[d.request_type];
+            var m = d.request_id ? S.last['id:' + d.request_id] : S.last[d.request_type];
             if (m && S.queue.indexOf(m) < 0) S.queue.push(m);
             prompt();
             notify();
@@ -183,7 +187,7 @@
             // Remember every type, not just the ones known to be protected: a page
             // sends its first requests before the backend has said which those are,
             // and a refused one must be resent after the login.
-            if (t) S.last[t] = msg;
+            if (t) { S.last[t] = msg; try { var data = JSON.parse(msg); if (data.request_id) S.last['id:' + data.request_id] = msg; } catch (e) {} }
             if (t && S.required && !S.authed && S.protected[t]) {
                 if (S.queue.indexOf(msg) < 0) S.queue.push(msg);
                 prompt();
@@ -192,6 +196,7 @@
             raw(msg);
         };
         ws.addEventListener('message', onMessage);
+        ws.addEventListener('close', function () { if (S.ws === ws) { S.queue = []; S.last = {}; S.authed = false; notify(); } });
         return ws;
     }
 

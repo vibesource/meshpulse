@@ -27,6 +27,7 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous"/>
     <link rel="stylesheet" href="styles.css?v=__ASSET_HASH__">
     <script src="auth.js?v=__ASSET_HASH__"></script>
+    <script src="message_bridge.js?v=__ASSET_HASH__"></script>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <style>
     /* Meshcore (net=MC) markers: square rotated 45° = diamond, regardless of role.
@@ -433,6 +434,10 @@
 
         // WebSocket connection
         let ws = null;
+        const pluginMessageBridge = new MessageBridge(
+            message => { if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Disconnected'); ws.send(JSON.stringify(message)); },
+            () => { const b = new Uint8Array(16); crypto.getRandomValues(b); return Array.from(b, x => x.toString(16).padStart(2, '0')).join(''); }
+        );
         let wsReconnectInterval = null;
         let pollingInterval = null;
         let isUsingWebSocket = false;
@@ -476,9 +481,12 @@
             try {
                 ws = new WebSocket(wsUrl);
                 if (window.MeshAuth) MeshAuth.attach(ws);
+                ws.addEventListener('meshauthcancel', e => pluginMessageBridge.cancelRequests(e.detail));
 
                 ws.onopen = () => {
                     console.log('[WS] Connected!');
+                    pluginMessageBridge.requestHistory();
+                    pluginMessageBridge.emit({type: 'connected'});
                     // A scan may already be running (or restoring) when the page opens.
                     try { ws.send(JSON.stringify({type: 'get_preset_scan'})); } catch (e) {}
                     updateWSStatus('connected');
@@ -511,6 +519,7 @@
                 ws.onmessage = (event) => {
                     try {
                         const data = JSON.parse(event.data);
+                        pluginMessageBridge.receive(data);
 
                         if (data.type === 'node_update') {
                             console.log('[WS] Node update:', data.node.id);
@@ -814,6 +823,7 @@
 
                 ws.onclose = () => {
                     console.log('[WS] Disconnected, will retry...');
+                    pluginMessageBridge.disconnected();
                     const wasConnected = isUsingWebSocket;
                     isUsingWebSocket = false;
                     ws = null;
@@ -1093,6 +1103,7 @@
                 const handler = (event) => {
                     try {
                         const data = JSON.parse(event.data);
+                        pluginMessageBridge.receive(data);
                         if (data.type === 'elevation_data') {
                             ws.removeEventListener('message', handler);
                             if (data.error) { reject(new Error(data.error)); return; }
@@ -3972,14 +3983,15 @@
                     onPacket: function(cb) { pluginPacketCallbacks[prefix] = cb; }
                 },
                 messages: {
-                    getAll: function(ch) { return []; },
+                    getAll: function(ch) { const groups = pluginMessageBridge.history; return ch == null ? Object.values(groups).flat() : (groups[ch] || []).slice(); },
                     onMessage: function(cb) { pluginMessageCallbacks[prefix] = cb; },
+                    subscribe: function(cb) { return pluginMessageBridge.subscribe(cb); },
+                    history: function() { return {messages: pluginMessageBridge.history, channelNames: pluginMessageBridge.channelNames, tracker: pluginMessageBridge.tracker}; },
+                    connected: function() { return !!(ws && ws.readyState === WebSocket.OPEN); },
+                    sendTracked: function(text, toId, ch, messageId) { return pluginMessageBridge.sendMessage(text, toId, ch, {messageId}); },
                     send: function(text, toId, ch) {
                         if (ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({
-                                type: 'send_message', text: text,
-                                dest_id: toId || null, channel: ch || 0
-                            }));
+                            ws.send(JSON.stringify({type: 'send_message', text: text, dest_id: toId || null, channel_index: ch || 0}));
                         }
                     }
                 },

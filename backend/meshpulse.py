@@ -39,6 +39,7 @@ import tempfile
 import uuid
 import admin_auth   # backend/admin_auth.py, next to this file
 import preset_scan  # backend/preset_scan.py: listen on other LoRa presets, then restore
+from delivery_tracker import DeliveryTracker
 import platform
 import meshtastic
 import meshtastic.tcp_interface
@@ -265,6 +266,14 @@ class TCPMeshtasticInterface:
         self.interface = None
         self._on_receive_ref = None
         self._on_mqtt_proxy_ref = None
+        self._last_device_frame = time.monotonic()
+
+    def note_device_frame(self):
+        """Record a successfully processed device protocol frame."""
+        self._last_device_frame = time.monotonic()
+
+    def device_stream_silent(self, timeout):
+        return time.monotonic() - self._last_device_frame > timeout
 
     def connect(self, on_receive=None):
         """Create TCPInterface and subscribe to incoming packets."""
@@ -309,6 +318,16 @@ class TCPMeshtasticInterface:
                 raise Exception("Connection timeout")
 
         iface_ref[0] = self.interface
+        # Mesh-packet callbacks omit queue status and other device responses.
+        # Count every successfully processed FromRadio frame, including replies
+        # to the Python library's existing 300-second heartbeat.
+        original_handler = self.interface._handleFromRadio
+        def observe_device_frame(payload):
+            result = original_handler(payload)
+            self.note_device_frame()
+            return result
+        self.interface._handleFromRadio = observe_device_frame
+        self.note_device_frame()
 
     @property
     def localNode(self):
@@ -1471,6 +1490,9 @@ class ListenBasedMapper:
         self.current_process = None
         self._serial_iface = None
         self._tcp_iface = None
+        # Serialize chat and plugin sends across their event loops and threads.
+        self._text_send_lock = threading.Lock()
+        self._delivery_tracker = DeliveryTracker()
         self._cli_reboot_pending = False
         # Preset scan: while the CLI holds the serial port the listener waits,
         # and after it the listener reconnects at once instead of after 60 s.
@@ -1499,6 +1521,12 @@ class ListenBasedMapper:
 
         # Store text messages per channel (dict: {channel_index: [messages]})
         self.messages = getattr(self, '_loaded_messages', {})
+        # In-flight correlation is not restored across a process restart.
+        for group in self.messages.values():
+            for message in group:
+                if message.get('delivery_status') in ('submitted', 'relayed', 'sending'):
+                    message['delivery_status'] = 'unknown'
+                    message['delivery_revision'] = message.get('delivery_revision', 0) + 1
 
         # Cache of all known node names from nodeinfo packets
         self.known_names = getattr(self, '_loaded_known_names', {})
@@ -3272,6 +3300,57 @@ class ListenBasedMapper:
             return self._tcp_iface.interface
         return None
 
+    def send_text_via_listener(self, text, to_id=None, channel=0):
+        """Submit text through the existing radio interface; never connect anew.
+
+        Called in a worker thread. Success means the library accepted the send,
+        not that the recipient acknowledged it. Do not retry automatically.
+        """
+        with self._text_send_lock:
+            if self._port_hold.is_set():
+                raise RuntimeError('Radio is busy with another operation')
+            iface = self._mesh_iface()
+            if iface is None:
+                raise RuntimeError('Radio is not connected')
+            connected = getattr(iface, 'isConnected', None)
+            if connected is not None and not connected.is_set():
+                raise RuntimeError('Radio is not connected')
+            iface.sendText(text, channelIndex=channel,
+                           destinationId=to_id or '^all')
+
+    def send_tracked_text_via_listener(self, text, to_id, channel, message):
+        """Request acknowledgments only for explicitly opted-in sends."""
+        with self._text_send_lock:
+            if self._port_hold.is_set():
+                raise RuntimeError('Radio is busy with another operation')
+            iface = self._mesh_iface()
+            connected = getattr(iface, 'isConnected', None) if iface else None
+            if iface is None or (connected is not None and not connected.is_set()):
+                raise RuntimeError('Radio is not connected')
+            local = int(self.local_node_id[1:], 16)
+            destination = int(to_id[1:], 16) if to_id else None
+            self._delivery_tracker.begin_send()
+            try:
+                sent = iface.sendText(text, channelIndex=channel,
+                                      destinationId=to_id or '^all', wantAck=True)
+            except Exception:
+                self._delivery_tracker.end_send()
+                raise
+            self._delivery_tracker.end_send(sent.id, destination, local, message)
+            return sent.id
+
+    async def broadcast_delivery_update(self, message):
+        event = {'type': 'message_delivery_update', 'message_id': message['message_id'],
+                 'status': message.get('delivery_status'),
+                 'revision': message.get('delivery_revision', 0),
+                 'error': message.get('delivery_error')}
+        websockets.broadcast(set(connected_clients), safe_json(event))
+
+    def handle_delivery_packet(self, packet):
+        update = self._delivery_tracker.receive(packet)
+        if update and update['context']:
+            asyncio.run(self.broadcast_delivery_update(update['context']))
+
     @staticmethod
     def _send_and_wait(iface, payload, dest, port, timeout, want_response=True, **kw):
         """sendData with onResponse, without the library's blocking waitForAckNak,
@@ -3807,6 +3886,8 @@ class ListenBasedMapper:
             return
         portnum = packet.get('decoded', {}).get('portnum', '')
         self._log_unparsed_packet(packet, portnum)
+        if portnum in ('ROUTING_APP', portnums_pb2.PortNum.Value('ROUTING_APP')):
+            self.handle_delivery_packet(packet)
         if portnum in ('NODEINFO_APP', portnums_pb2.PortNum.Value('NODEINFO_APP')):
             self.parse_node_info_from_packet(packet)
         elif portnum in ('POSITION_APP', portnums_pb2.PortNum.Value('POSITION_APP')):
@@ -4411,6 +4492,11 @@ class ListenBasedMapper:
         try:
             from_id = sanitize_node_id(packet.get('fromId'))
             if not from_id:
+                # Some API packets contain only the numeric protobuf sender.
+                sender = packet.get('from')
+                if type(sender) is int and 0 < sender < 0xffffffff:
+                    from_id = f"!{sender:08x}"
+            if not from_id:
                 return False
 
             to_id = packet.get('toId', '^all')
@@ -4974,6 +5060,8 @@ class ListenBasedMapper:
                 return
             portnum = packet.get('decoded', {}).get('portnum', '')
             self._log_unparsed_packet(packet, portnum)
+            if portnum in ('ROUTING_APP', portnums_pb2.PortNum.Value('ROUTING_APP')):
+                self.handle_delivery_packet(packet)
             if portnum in ('NODEINFO_APP', portnums_pb2.PortNum.Value('NODEINFO_APP')):
                 self.parse_node_info_from_packet(packet)
             elif portnum in ('POSITION_APP', portnums_pb2.PortNum.Value('POSITION_APP')):
@@ -5235,10 +5323,12 @@ class ListenBasedMapper:
                         self._force_reconnect = False
                         raise Exception("Reconnect after a preset scan settings change")
 
-                    # Health check — if no packet received for 90s after connection, assume disconnect
-                    silence = time.time() - self._last_radio_packet_time
-                    if silence > (900 if _scan_capturing() else 90) and first_save_done:
-                        print(f"[TCP] No packets for {int(silence)}s — assuming disconnect, reconnecting...")
+                    # Quiet RF is normal. The Python interface sends a device
+                    # heartbeat every 300s; allow 120s extra for its response.
+                    # Track every valid device frame, not just mesh packets.
+                    timeout = 900 if _scan_capturing() else 420
+                    if tcp_iface.device_stream_silent(timeout) and first_save_done:
+                        print(f"[TCP] No device protocol frames for {timeout}s — reconnecting...")
                         raise Exception("TCP silent disconnect detected")
 
                     time.sleep(1)
@@ -5509,122 +5599,80 @@ def parse_traceroute_output(output):
     return route, route_back
 
 
-async def run_send_message(text, channel_index, dest_id, websocket):
-    """Send a text message.
-    TCP mode: uses a dedicated TCPInterface (no listener stop needed).
-    Serial mode: sends via Python API (no listener stop needed).
-    """
+async def run_send_message(text, channel_index, dest_id, websocket, tracking_id=None, request_id=None):
+    """Submit text through the live radio connection and report the result."""
+    def result(data):
+        if request_id is not None:
+            data['request_id'] = request_id
+        return data
+
     try:
         if not mapper:
-            await websocket.send(json.dumps({'type': 'send_result', 'success': False, 'message': 'Mapper not ready'}, ensure_ascii=False))
+            await websocket.send(json.dumps(result({'type': 'send_result', 'success': False, 'message': 'Mapper not ready'}), ensure_ascii=False))
             return
-
         await websocket.send(json.dumps({
             'type': 'send_status', 'status': 'sending', 'connection_type': mapper.connection_type
         }, ensure_ascii=False))
+        loop = asyncio.get_running_loop()
+        tracked_message = None
+        if tracking_id:
+            tracked_message = {
+                'from_id': mapper.local_node_id, 'from_name': 'You',
+                'to_id': dest_id if dest_id else '^all', 'text': text,
+                'timestamp': int(time.time()), 'is_dm': bool(dest_id),
+                'channel_index': channel_index, 'message_id': tracking_id,
+                'delivery_status': 'submitted', 'delivery_revision': 0,
+            }
+            future = loop.run_in_executor(None, mapper.send_tracked_text_via_listener,
+                                          text, dest_id, channel_index, tracked_message)
+        else:
+            future = loop.run_in_executor(None, mapper.send_text_via_listener, text, dest_id, channel_index)
 
-        if mapper.connection_type == 'tcp':
-            # TCP: create a separate TCPInterface just for sending; do NOT stop listener
-            loop = asyncio.get_event_loop()
-
-            def _do_tcp_send():
-                tcp_host, tcp_port = parse_tcp_target(mapper.host)
-                if tcp_port is None:
-                    return False, f"Invalid port in '{mapper.host}', must be 1-65535"
-                iface = meshtastic.tcp_interface.TCPInterface(
-                    hostname=tcp_host, portNumber=tcp_port, noProto=False
-                )
-                try:
-                    iface.sendText(
-                        text,
-                        channelIndex=channel_index,
-                        destinationId=dest_id if dest_id else '^all'
-                    )
-                    return True, 'Message sent'
-                except Exception as exc:
-                    return False, str(exc)
-                finally:
-                    try:
-                        iface.close()
-                    except Exception:
-                        pass
-
-            try:
-                success, msg = await asyncio.wait_for(
-                    loop.run_in_executor(None, _do_tcp_send),
-                    timeout=30
-                )
-            except asyncio.TimeoutError:
-                success, msg = False, 'Send timed out'
-
-            print(f"[SEND] TCP ch={channel_index} dest={dest_id or 'broadcast'}: {'OK' if success else 'FAIL'} - {msg}")
-            await websocket.send(json.dumps({'type': 'send_result', 'success': success, 'message': msg}, ensure_ascii=False))
-            await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': success}, ensure_ascii=False))
-
-            if success:
-                sent_message = {
-                    'from_id': mapper.local_node_id,
-                    'from_name': 'You',
-                    'to_id': dest_id if dest_id else '^all',
-                    'text': text,
-                    'timestamp': int(time.time()),
-                    'is_dm': bool(dest_id),
-                    'channel_index': channel_index
-                }
-                if channel_index not in mapper.messages:
-                    mapper.messages[channel_index] = []
-                mapper.messages[channel_index].insert(0, sent_message)
-                await mapper.broadcast_message(sent_message)
-
-            # No listener restart needed for TCP
-            return
-
-        # Serial/USB: send via Python API (no listener stop needed)
-        loop = asyncio.get_event_loop()
-
-        def _do_serial_send():
-            if not mapper._serial_iface:
-                raise Exception("Not connected")
-            mapper._serial_iface.sendText(
-                text,
-                channelIndex=channel_index,
-                destinationId=dest_id if dest_id else '^all'
-            )
-            return True, 'Message sent'
+        async def record_tracked(packet_id, late=False):
+            if late:
+                tracked_message['delivery_revision'] = max(tracked_message.get('delivery_revision', 0), 2)
+            mapper.messages.setdefault(channel_index, []).insert(0, tracked_message)
+            await mapper.broadcast_message(tracked_message)
+            async def expire_tracking():
+                await asyncio.sleep(300)
+                updated = mapper._delivery_tracker.mark_unconfirmed(packet_id)
+                if updated:
+                    await mapper.broadcast_delivery_update(updated)
+            asyncio.create_task(expire_tracking())
 
         try:
-            success, msg = await asyncio.wait_for(
-                loop.run_in_executor(None, _do_serial_send),
-                timeout=30
-            )
+            packet_id = await asyncio.wait_for(asyncio.shield(future), timeout=30)
         except asyncio.TimeoutError:
-            success, msg = False, 'Send timed out'
+            # The worker cannot be cancelled safely and could still transmit.
+            if tracked_message:
+                async def observe_late_send():
+                    try:
+                        packet_id = await future
+                        await record_tracked(packet_id, late=True)
+                    except Exception as late_error:
+                        print(f"[SEND] Late send outcome: {late_error}")
+                asyncio.create_task(observe_late_send())
+            raise RuntimeError('Send timed out; delivery outcome is unknown')
 
-        print(f"[SEND] Serial ch={channel_index} dest={dest_id or 'broadcast'}: {'OK' if success else 'FAIL'} - {msg}")
-        await websocket.send(json.dumps({'type': 'send_result', 'success': success, 'message': msg}, ensure_ascii=False))
-        await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': success}, ensure_ascii=False))
-
-        if success:
-            sent_message = {
-                'from_id': mapper.local_node_id,
-                'from_name': 'You',
-                'to_id': dest_id if dest_id else '^all',
-                'text': text,
-                'timestamp': int(time.time()),
-                'is_dm': bool(dest_id),
-                'channel_index': channel_index
-            }
-            if channel_index not in mapper.messages:
-                mapper.messages[channel_index] = []
-            mapper.messages[channel_index].insert(0, sent_message)
-            await mapper.broadcast_message(sent_message)
-
-    except asyncio.TimeoutError:
-        await websocket.send(json.dumps({'type': 'send_result', 'success': False, 'message': 'Send timed out'}, ensure_ascii=False))
-        await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': False}, ensure_ascii=False))
+        if tracked_message:
+            await record_tracked(packet_id)
+        await websocket.send(json.dumps(result({'type': 'send_result', 'success': True, 'message': 'Message submitted'}), ensure_ascii=False))
+        await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': True}, ensure_ascii=False))
+        if tracked_message:
+            return
+        sent_message = {
+            'from_id': mapper.local_node_id, 'from_name': 'You',
+            'to_id': dest_id if dest_id else '^all', 'text': text,
+            'timestamp': int(time.time()), 'is_dm': bool(dest_id),
+            'channel_index': channel_index,
+        }
+        if channel_index not in mapper.messages:
+            mapper.messages[channel_index] = []
+        mapper.messages[channel_index].insert(0, sent_message)
+        await mapper.broadcast_message(sent_message)
     except Exception as e:
         print(f"[SEND] Error: {e}")
-        await websocket.send(json.dumps({'type': 'send_result', 'success': False, 'message': str(e)}, ensure_ascii=False))
+        await websocket.send(json.dumps(result({'type': 'send_result', 'success': False, 'message': str(e)}), ensure_ascii=False))
         await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': False}, ensure_ascii=False))
 
 
@@ -5796,54 +5844,99 @@ async def run_traceroute(node_id, websocket):
                 }, ensure_ascii=False))
             return
 
-        # TCP: run alongside listener, no interruption needed
-        cmd = [mapper.meshtastic_cmd, '--host', mapper.host, '--traceroute', node_id]
-        print(f"[TRACEROUTE] TCP mode, running: {' '.join(cmd)}")
+        # Use the existing connection: a second TCP client can evict the listener.
+        from meshtastic import mesh_pb2, portnums_pb2
 
+        iface = mapper._mesh_iface()
+        if iface is None or mapper._port_hold.is_set():
+            raise RuntimeError('Radio is not connected or is busy')
+        connected = getattr(iface, 'isConnected', None)
+        if connected is not None and not connected.is_set():
+            raise RuntimeError('Radio is not connected')
+
+        response = loop.create_future()
+        deadline = time.monotonic() + 60
+
+        def on_response(packet):
+            def complete():
+                if not response.done():
+                    response.set_result(packet)
+            try:
+                loop.call_soon_threadsafe(complete)
+            except RuntimeError:
+                pass  # Event loop has stopped.
+
+        def send_request():
+            with mapper._text_send_lock:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Traceroute expired before sending')
+                if mapper._port_hold.is_set() or mapper._mesh_iface() is not iface:
+                    raise RuntimeError('Radio connection changed before sending')
+                connected = getattr(iface, 'isConnected', None)
+                if connected is not None and not connected.is_set():
+                    raise RuntimeError('Radio is not connected')
+                return iface.sendData(mesh_pb2.RouteDiscovery(), destinationId=node_id,
+                                      portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                      wantResponse=True, onResponse=on_response, hopLimit=5)
+
+        send_future = loop.run_in_executor(None, send_request)
+        sent_packet = None
         try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=57)
-                ),
-                timeout=60.0
-            )
-            raw_output = result.stdout + result.stderr
-            print(f"[TRACEROUTE] Output: {raw_output[:300]}")
+            sent_packet = await asyncio.wait_for(asyncio.shield(send_future),
+                                                 max(0, deadline - time.monotonic()))
+            packet = await asyncio.wait_for(response, max(0, deadline - time.monotonic()))
         except asyncio.TimeoutError:
-            await websocket.send(json.dumps({
-                'type': 'traceroute_result', 'node_id': node_id, 'error': 'Timeout'
-            }, ensure_ascii=False))
-            return
+            raise RuntimeError('Traceroute timed out; the request may have been sent')
+        finally:
+            def cleanup(future):
+                try:
+                    sent = future.result()
+                    iface.responseHandlers.pop(sent.id, None)
+                except Exception:
+                    pass
+            if send_future.done():
+                cleanup(send_future)
+            else:
+                send_future.add_done_callback(cleanup)
+            if not response.done():
+                response.cancel()
 
-        route, route_back = parse_traceroute_output(raw_output)
-
-        # Enrich hops with coordinates from known nodes
+        decoded = packet.get('decoded', {})
+        if decoded.get('portnum') == 'ROUTING_APP':
+            reason = decoded.get('routing', {}).get('errorReason', 'Unknown error')
+            raise RuntimeError(f'Traceroute failed: {reason}')
+        if decoded.get('portnum') != 'TRACEROUTE_APP':
+            raise RuntimeError('Unexpected traceroute response')
+        if node_id.startswith('!') and packet.get('from') != int(node_id[1:], 16):
+            raise RuntimeError('Traceroute response came from an unexpected node')
+        tr = decoded.get('traceroute')
+        if not isinstance(tr, dict) or 'from' not in packet or 'to' not in packet:
+            raise RuntimeError('Invalid traceroute response')
         all_known = {**mapper.nodes, **mapper.nodes_no_position}
-        for hop in route + route_back:
-            hop_id = hop.get('id')
-            hop_name = hop.get('name')
-            node_data = None
-            if hop_id and hop_id in all_known:
-                node_data = all_known[hop_id]
-            if not node_data and hop_name:
-                for nid, n in mapper.nodes.items():
-                    if n.get('name') == hop_name:
-                        node_data = n
-                        hop['id'] = nid
-                        break
-            if node_data:
-                if 'lat' in node_data:
-                    hop['lat'] = node_data['lat']
-                    hop['lon'] = node_data['lon']
-                hop['name'] = node_data.get('name', hop.get('name', hop_id))
 
+        def hop(num, snr=None):
+            key = f'!{num:08x}'
+            known = all_known.get(key, {})
+            return {'id': key, 'name': known.get('name', key),
+                    'lat': known.get('lat'), 'lon': known.get('lon'),
+                    'snr': round(snr / 4.0, 2) if snr is not None and snr != -128 else None}
+
+        def build_route(first, middle, last, snrs):
+            values = list(snrs) if len(snrs) == len(middle) + 1 else []
+            return ([hop(first)] +
+                    [hop(num, values[i] if values else None) for i, num in enumerate(middle)] +
+                    [hop(last, values[-1] if values else None)])
+
+        route = build_route(packet['to'], tr.get('route', []), packet['from'], tr.get('snrTowards', []))
+        back_hops = tr.get('routeBack', [])
+        back_snrs = tr.get('snrBack', [])
+        # As in the Meshtastic client, only show a return route when the
+        # response contains enough information to distinguish it from missing data.
+        route_back = (build_route(packet['from'], back_hops, packet['to'], back_snrs)
+                      if 'hopStart' in packet and len(back_snrs) == len(back_hops) + 1 else [])
         await websocket.send(json.dumps({
-            'type': 'traceroute_result',
-            'node_id': node_id,
-            'route': route,
-            'route_back': route_back,
-            'raw': raw_output
+            'type': 'traceroute_result', 'node_id': node_id,
+            'route': route, 'route_back': route_back, 'raw': ''
         }, ensure_ascii=False))
 
     except Exception as e:
@@ -6190,7 +6283,7 @@ async def websocket_handler(websocket):
                 if _t in admin_auth.PROTECTED:
                     _auth = _admin_auth()
                     if _auth.required() and authed_key != _auth.fingerprint():
-                        await websocket.send(json.dumps({'type': 'auth_required', 'request_type': _t}))
+                        await websocket.send(json.dumps({'type': 'auth_required', 'request_type': _t, **({'request_id': data['request_id']} if isinstance(data.get('request_id'), str) and len(data['request_id']) <= 128 else {})}))
                         continue
                 if _t in UPLOAD_TYPES:
                     await _handle_upload_message(websocket, data)
@@ -6207,8 +6300,21 @@ async def websocket_handler(websocket):
                     text = data.get('text', '').strip()
                     channel_index = int(data.get('channel_index', 0))
                     dest_id = data.get('dest_id') or None
+                    request_id = data.get('request_id')
+                    if not isinstance(request_id, str) or len(request_id) > 128:
+                        request_id = None
+                    tracking_id = None
+                    if data.get('delivery_tracking') is True:
+                        try:
+                            tracking_id = str(uuid.UUID(data.get('message_id', '')))
+                            if dest_id and not re.fullmatch(r'![0-9a-fA-F]{8}', dest_id):
+                                raise ValueError('Invalid destination')
+                        except (ValueError, TypeError, AttributeError):
+                            await websocket.send(json.dumps({'type': 'send_result', 'success': False,
+                                'message': 'Invalid tracked send request', **({'request_id': request_id} if request_id else {})}))
+                            continue
                     if text:
-                        asyncio.ensure_future(run_send_message(text, channel_index, dest_id, websocket))
+                        asyncio.ensure_future(run_send_message(text, channel_index, dest_id, websocket, tracking_id, request_id))
                     else:
                         print(f"[WS] send_message missing text from {client_addr}")
                 elif data.get('type') == 'get_stats':
