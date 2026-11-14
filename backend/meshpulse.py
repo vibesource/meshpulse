@@ -39,6 +39,7 @@ import tempfile
 import uuid
 import admin_auth   # backend/admin_auth.py, next to this file
 import preset_scan  # backend/preset_scan.py: listen on other LoRa presets, then restore
+from delivery_tracker import DeliveryTracker
 import platform
 import meshtastic
 import meshtastic.tcp_interface
@@ -1473,6 +1474,7 @@ class ListenBasedMapper:
         self._tcp_iface = None
         # Serialize chat and plugin sends across their event loops and threads.
         self._text_send_lock = threading.Lock()
+        self._delivery_tracker = DeliveryTracker()
         self._cli_reboot_pending = False
         # Preset scan: while the CLI holds the serial port the listener waits,
         # and after it the listener reconnects at once instead of after 60 s.
@@ -1501,6 +1503,12 @@ class ListenBasedMapper:
 
         # Store text messages per channel (dict: {channel_index: [messages]})
         self.messages = getattr(self, '_loaded_messages', {})
+        # In-flight correlation is not restored across a process restart.
+        for group in self.messages.values():
+            for message in group:
+                if message.get('delivery_status') in ('submitted', 'relayed', 'sending'):
+                    message['delivery_status'] = 'unknown'
+                    message['delivery_revision'] = message.get('delivery_revision', 0) + 1
 
         # Cache of all known node names from nodeinfo packets
         self.known_names = getattr(self, '_loaded_known_names', {})
@@ -3292,6 +3300,39 @@ class ListenBasedMapper:
             iface.sendText(text, channelIndex=channel,
                            destinationId=to_id or '^all')
 
+    def send_tracked_text_via_listener(self, text, to_id, channel, message):
+        """Request acknowledgments only for explicitly opted-in sends."""
+        with self._text_send_lock:
+            if self._port_hold.is_set():
+                raise RuntimeError('Radio is busy with another operation')
+            iface = self._mesh_iface()
+            connected = getattr(iface, 'isConnected', None) if iface else None
+            if iface is None or (connected is not None and not connected.is_set()):
+                raise RuntimeError('Radio is not connected')
+            local = int(self.local_node_id[1:], 16)
+            destination = int(to_id[1:], 16) if to_id else None
+            self._delivery_tracker.begin_send()
+            try:
+                sent = iface.sendText(text, channelIndex=channel,
+                                      destinationId=to_id or '^all', wantAck=True)
+            except Exception:
+                self._delivery_tracker.end_send()
+                raise
+            self._delivery_tracker.end_send(sent.id, destination, local, message)
+            return sent.id
+
+    async def broadcast_delivery_update(self, message):
+        event = {'type': 'message_delivery_update', 'message_id': message['message_id'],
+                 'status': message.get('delivery_status'),
+                 'revision': message.get('delivery_revision', 0),
+                 'error': message.get('delivery_error')}
+        websockets.broadcast(set(connected_clients), safe_json(event))
+
+    def handle_delivery_packet(self, packet):
+        update = self._delivery_tracker.receive(packet)
+        if update and update['context']:
+            asyncio.run(self.broadcast_delivery_update(update['context']))
+
     @staticmethod
     def _send_and_wait(iface, payload, dest, port, timeout, want_response=True, **kw):
         """sendData with onResponse, without the library's blocking waitForAckNak,
@@ -3827,6 +3868,8 @@ class ListenBasedMapper:
             return
         portnum = packet.get('decoded', {}).get('portnum', '')
         self._log_unparsed_packet(packet, portnum)
+        if portnum in ('ROUTING_APP', portnums_pb2.PortNum.Value('ROUTING_APP')):
+            self.handle_delivery_packet(packet)
         if portnum in ('NODEINFO_APP', portnums_pb2.PortNum.Value('NODEINFO_APP')):
             self.parse_node_info_from_packet(packet)
         elif portnum in ('POSITION_APP', portnums_pb2.PortNum.Value('POSITION_APP')):
@@ -4994,6 +5037,8 @@ class ListenBasedMapper:
                 return
             portnum = packet.get('decoded', {}).get('portnum', '')
             self._log_unparsed_packet(packet, portnum)
+            if portnum in ('ROUTING_APP', portnums_pb2.PortNum.Value('ROUTING_APP')):
+                self.handle_delivery_packet(packet)
             if portnum in ('NODEINFO_APP', portnums_pb2.PortNum.Value('NODEINFO_APP')):
                 self.parse_node_info_from_packet(packet)
             elif portnum in ('POSITION_APP', portnums_pb2.PortNum.Value('POSITION_APP')):
@@ -5529,27 +5574,67 @@ def parse_traceroute_output(output):
     return route, route_back
 
 
-async def run_send_message(text, channel_index, dest_id, websocket):
+async def run_send_message(text, channel_index, dest_id, websocket, tracking_id=None, request_id=None):
     """Submit text through the live radio connection and report the result."""
+    def result(data):
+        if request_id is not None:
+            data['request_id'] = request_id
+        return data
+
     try:
         if not mapper:
-            await websocket.send(json.dumps({'type': 'send_result', 'success': False, 'message': 'Mapper not ready'}, ensure_ascii=False))
+            await websocket.send(json.dumps(result({'type': 'send_result', 'success': False, 'message': 'Mapper not ready'}), ensure_ascii=False))
             return
         await websocket.send(json.dumps({
             'type': 'send_status', 'status': 'sending', 'connection_type': mapper.connection_type
         }, ensure_ascii=False))
         loop = asyncio.get_running_loop()
+        tracked_message = None
+        if tracking_id:
+            tracked_message = {
+                'from_id': mapper.local_node_id, 'from_name': 'You',
+                'to_id': dest_id if dest_id else '^all', 'text': text,
+                'timestamp': int(time.time()), 'is_dm': bool(dest_id),
+                'channel_index': channel_index, 'message_id': tracking_id,
+                'delivery_status': 'submitted', 'delivery_revision': 0,
+            }
+            future = loop.run_in_executor(None, mapper.send_tracked_text_via_listener,
+                                          text, dest_id, channel_index, tracked_message)
+        else:
+            future = loop.run_in_executor(None, mapper.send_text_via_listener, text, dest_id, channel_index)
+
+        async def record_tracked(packet_id, late=False):
+            if late:
+                tracked_message['delivery_revision'] = max(tracked_message.get('delivery_revision', 0), 2)
+            mapper.messages.setdefault(channel_index, []).insert(0, tracked_message)
+            await mapper.broadcast_message(tracked_message)
+            async def expire_tracking():
+                await asyncio.sleep(300)
+                updated = mapper._delivery_tracker.mark_unconfirmed(packet_id)
+                if updated:
+                    await mapper.broadcast_delivery_update(updated)
+            asyncio.create_task(expire_tracking())
+
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, mapper.send_text_via_listener, text, dest_id, channel_index),
-                timeout=30,
-            )
+            packet_id = await asyncio.wait_for(asyncio.shield(future), timeout=30)
         except asyncio.TimeoutError:
             # The worker cannot be cancelled safely and could still transmit.
+            if tracked_message:
+                async def observe_late_send():
+                    try:
+                        packet_id = await future
+                        await record_tracked(packet_id, late=True)
+                    except Exception as late_error:
+                        print(f"[SEND] Late send outcome: {late_error}")
+                asyncio.create_task(observe_late_send())
             raise RuntimeError('Send timed out; delivery outcome is unknown')
 
-        await websocket.send(json.dumps({'type': 'send_result', 'success': True, 'message': 'Message submitted'}, ensure_ascii=False))
+        if tracked_message:
+            await record_tracked(packet_id)
+        await websocket.send(json.dumps(result({'type': 'send_result', 'success': True, 'message': 'Message submitted'}), ensure_ascii=False))
         await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': True}, ensure_ascii=False))
+        if tracked_message:
+            return
         sent_message = {
             'from_id': mapper.local_node_id, 'from_name': 'You',
             'to_id': dest_id if dest_id else '^all', 'text': text,
@@ -5562,7 +5647,7 @@ async def run_send_message(text, channel_index, dest_id, websocket):
         await mapper.broadcast_message(sent_message)
     except Exception as e:
         print(f"[SEND] Error: {e}")
-        await websocket.send(json.dumps({'type': 'send_result', 'success': False, 'message': str(e)}, ensure_ascii=False))
+        await websocket.send(json.dumps(result({'type': 'send_result', 'success': False, 'message': str(e)}), ensure_ascii=False))
         await websocket.send(json.dumps({'type': 'send_status', 'status': 'done', 'success': False}, ensure_ascii=False))
 
 
@@ -6128,7 +6213,7 @@ async def websocket_handler(websocket):
                 if _t in admin_auth.PROTECTED:
                     _auth = _admin_auth()
                     if _auth.required() and authed_key != _auth.fingerprint():
-                        await websocket.send(json.dumps({'type': 'auth_required', 'request_type': _t}))
+                        await websocket.send(json.dumps({'type': 'auth_required', 'request_type': _t, **({'request_id': data['request_id']} if isinstance(data.get('request_id'), str) and len(data['request_id']) <= 128 else {})}))
                         continue
                 if _t in UPLOAD_TYPES:
                     await _handle_upload_message(websocket, data)
@@ -6145,8 +6230,21 @@ async def websocket_handler(websocket):
                     text = data.get('text', '').strip()
                     channel_index = int(data.get('channel_index', 0))
                     dest_id = data.get('dest_id') or None
+                    request_id = data.get('request_id')
+                    if not isinstance(request_id, str) or len(request_id) > 128:
+                        request_id = None
+                    tracking_id = None
+                    if data.get('delivery_tracking') is True:
+                        try:
+                            tracking_id = str(uuid.UUID(data.get('message_id', '')))
+                            if dest_id and not re.fullmatch(r'![0-9a-fA-F]{8}', dest_id):
+                                raise ValueError('Invalid destination')
+                        except (ValueError, TypeError, AttributeError):
+                            await websocket.send(json.dumps({'type': 'send_result', 'success': False,
+                                'message': 'Invalid tracked send request', **({'request_id': request_id} if request_id else {})}))
+                            continue
                     if text:
-                        asyncio.ensure_future(run_send_message(text, channel_index, dest_id, websocket))
+                        asyncio.ensure_future(run_send_message(text, channel_index, dest_id, websocket, tracking_id, request_id))
                     else:
                         print(f"[WS] send_message missing text from {client_addr}")
                 elif data.get('type') == 'get_stats':
