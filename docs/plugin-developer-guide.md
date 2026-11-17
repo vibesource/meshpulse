@@ -341,13 +341,66 @@ window.MeshPlugin = MyPlugin;
 | `api.panels` | `register(el)`, `unregister(el)` — preferred way to add a control panel (2.6.1+) |
 | `api.nodes` | `getVisible()`, `getVisibleNoPosition()`, `getAll()`, `get(id)`, `getTracker()`, `getNoPosition()`, `onUpdate(cb)`, `onExpire(cb)`, `onFilterChange(cb)`; 2.9.4+ `addFilter(fn)`, `removeFilter()`, `refilter()` ([details](#apinodesaddfilter-294)) |
 | `api.config` | 2.9.4+ `save(updates, cb)`: store your settings on the MeshPulse host ([details](#apiconfigsave-294)) |
-| `api.messages` | `getAll()`, `onMessage(cb)`, `send(text, toId, channel)` |
+| `api.messages` | `getAll(channel)`, `onMessage(cb)`, `send(text, toId, channel)`, `history()`, `subscribe(cb)`, `connected()`, `sendTracked(text, toId, channel, messageId)` ([details](#apimessages)) |
 | `api.packets` | `onPacket(cb)`: every packet this mapper's radio hears, live (2.9.3+, [details](#apipackets-293)) |
 | `api.presetScan` | 2.9.5+ `refresh()`, `start(presets, dwellS)`, `stop()`, `history(id)`, `onMessage(cb)`, `state()`: listen on other LoRa presets ([details](#apipresetscan-295)) |
 | `api.ws` | `subscribe(channel, cb)`, `unsubscribe(channel)`, `send(channel, data)` |
 | `api.ui` | `addNavItem(label, onClick)`, `addPanel(id, html, position)`, `showNotification(msg, type)` |
 | `api.storage` | `get(key)`, `set(key, value)`, `remove(key)`, `getAll()` — auto-namespaced per plugin |
 | `api.info` | `id`, `version`, `config`, `dataUrl(path)` |
+
+### `api.messages`
+
+The map page shares its existing WebSocket and authentication flow with frontend
+plugins. These methods are available on the plugin messaging bridge; check for
+individual methods when supporting older MeshPulse releases.
+
+- `getAll(channel)` returns cached messages for a channel; omit `channel` to
+  return messages from all channels. The cache is populated asynchronously.
+- `history()` returns `{messages, channelNames, tracker}`. `messages` is grouped
+  by channel index; `tracker` is the latest tracker information, or `null`.
+  Treat these values as read-only and wait for a `history` event if necessary.
+- `subscribe(callback)` receives `{type: 'history', messages, channelNames}`,
+  `{type: 'message', message}`, `{type: 'delivery', update}`,
+  `{type: 'tracker', tracker}`, and `connected` or `disconnected` events.
+  It returns an unsubscribe function; call it when disabling the plugin.
+- `connected()` reports whether the page's WebSocket is open. It does not
+  guarantee that a radio is connected or that a message can be delivered.
+- `sendTracked(text, toId, channel, messageId)` returns a promise resolving to
+  the correlated send result. Use `null` for a channel broadcast or a node ID
+  such as `!12345678` for a direct message; channel is a zero-based index.
+  Supply a unique UUID string as `messageId` to opt in to delivery tracking.
+  Check `result.success` and `result.message`: a resolved promise can report a
+  failed send. A disconnect can reject the promise with an unknown outcome.
+  Never automatically retry an uncertain send.
+
+A successful send result means submission, not delivery. Delivery events contain
+`message_id`, `status`, `revision` and possibly `error`; correlate them by the
+UUID and ignore stale revisions. States include `submitted`, `relayed`,
+`delivered_mesh`, `delivered_recipient`, `unconfirmed`, `unknown`, and `failed`.
+A missing acknowledgement or radio error does not prove a message was never
+received. The core handles unlocking for protected sends; plugins should not
+ask for or store the admin password. Message history and generic plugin WebSocket
+channels do not inherit send authorization simply because protected sends do.
+
+```javascript
+// Keep the returned function and call it from onDisable.
+this.unsubscribeMessages = api.messages.subscribe(function (event) {
+    if (event.type === 'message') console.log(event.message);
+    if (event.type === 'delivery') console.log(event.update);
+});
+
+// Use a fresh UUID per send; crypto.randomUUID requires a secure context.
+const messageId = crypto.randomUUID();
+api.messages.sendTracked('Hello', null, 0, messageId).then(function (result) {
+    if (!result.success) console.warn(result.message);
+}).catch(function (error) {
+    console.warn(error.message); // the outcome may be unknown
+});
+```
+
+The legacy `onMessage(cb)` and fire-and-forget `send(text, toId, channel)`
+remain available. `send` does not return a delivery result.
 
 ### Control Panels (`api.panels`)
 
